@@ -90,7 +90,8 @@ For the free Start Plan, the banner "当前系统繁忙…" kills the turn via `
 2. adds a message-based fallback to the turn-level retry gate: any error in the cause chain whose message matches `concurrency / busy / overload / 繁忙` is retryable (covers the no-code case);
 3. retry delay becomes **random 3–13 seconds per retry** (cap: 10 *consecutive* failures, replacing the fixed backoff table);
 4. the adapter-level error classifier gets the same message-based fallback marking `retryable=true` — background model requests that never go through the main turn loop (session hydration; the error dialog shows TraceID `hydrate-trace`) only pass through this classifier, and without the patch concurrency errors still fail with zero retries there;
-5. **the retry counter resets on any successful model request** — officially it accumulates for the whole turn (retry 3×, succeed, then fail again later and only 7 retries remain); with the reset the cap truly counts 10 consecutive failures.
+5. **the retry counter resets on any successful model request** — officially it accumulates for the whole turn (retry 3×, succeed, then fail again later and only 7 retries remain); with the reset the cap truly counts 10 consecutive failures;
+6. **first turn of a new session retries too** — the official gate requires `turnNumber > 0`, but `turnNumber` only increments when a turn *ends*, so a new session's very first turn (even a 15-minute agentic one) runs with `turnNumber === 0` and was locked out of retries entirely (confirmed in the wild).
 
 ```bash
 node scripts/patch-retry-table.mjs apply    # reversible, idempotent, backs up zcode.cjs

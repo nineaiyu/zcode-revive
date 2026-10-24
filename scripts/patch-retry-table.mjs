@@ -24,7 +24,10 @@
  *   5. 模型请求成功即清零重试计数——官方计数器只在回合创建时清零、成功不清零，
  *      长回合中「3 次重试成功 → 稍后再失败」只剩 7 次额度；清零后 10 次上限
  *      按「连续失败」计，与直觉一致；
- *   6. （仅对官方原始文件）扩写重试表档数 2 → 10（P3o=10 次上限的配套长度）。
+ *   6. 移除「仅第 2+ 回合才重试」限制：官方 turnNumber 在回合结束时才 +1，
+ *      新会话**第一回合**进行中恒为 0，被 L3o 首个条件挡在重试门外
+ *      （实测：新会话 16 分钟长回合于 00:40 遭并发超限直接失败、零重试）；
+ *   7. （仅对官方原始文件）扩写重试表档数 2 → 10（P3o=10 次上限的配套长度）。
  *
  * 用法：
  *   node patch-retry-table.mjs apply    # 应用补丁（幂等）
@@ -149,6 +152,21 @@ const PATCHES = [
         (_m, fn, st) => `${fn}(${st}.turnAbortSignal),${st}.streamRecoveryRetryCount=0}catch(`,
       ),
   },
+  {
+    id: 'first-turn-gate',
+    describe: '移除「仅第 2+ 回合才重试」限制——新会话第一回合（turnNumber=0）同样自动重试',
+    // 官方 turnNumber 在回合结束时 +1，新会话首个回合进行中恒为 0：
+    // function L3o(e){if(!(e.turnNumber<=0)&&Q4a.has(…)&&v8e(…))return …}
+    //                                        ↑ 首回合被挡在门外
+    // 「turnNumber<=0」在全文件仅此一处，以它不存在为已应用标志
+    detect: (text) => !text.includes('turnNumber<=0'),
+    regex: /function ([\w$]+)\(e\)\{if\(!\(e\.turnNumber<=0\)&&([\w$]+)\.has\(e\.providerId\)&&([\w$]+)\(e\.error\)\)return/,
+    replace: (text) =>
+      text.replace(
+        /function ([\w$]+)\(e\)\{if\(!\(e\.turnNumber<=0\)&&([\w$]+)\.has\(e\.providerId\)&&([\w$]+)\(e\.error\)\)return/,
+        (_m, fn, set, err) => `function ${fn}(e){if(${set}.has(e.providerId)&&${err}(e.error))return`,
+      ),
+  },
 ];
 
 // 旧补丁：扩写重试表档数（仅当文件仍是官方 2 档表时需要；已被 10 档则跳过）
@@ -173,6 +191,7 @@ function inspect(text) {
     messageFallback: applied.includes('message-fallback'),
     adapterFallback: applied.includes('adapter-fallback'),
     resetOnSuccess: applied.includes('reset-on-success'),
+    firstTurnGate: applied.includes('first-turn-gate'),
     tableExpanded: text.includes(PATCHED_TABLE),
   };
 }
@@ -224,6 +243,7 @@ if (command === 'status') {
   console.log(`消息兜底匹配: ${s.messageFallback ? '已应用' : '未应用'}`);
   console.log(`适配器层兜底: ${s.adapterFallback ? '已应用' : '未应用'}`);
   console.log(`成功清零连击: ${s.resetOnSuccess ? '已应用' : '未应用'}`);
+  console.log(`首回合可重试: ${s.firstTurnGate ? '已应用' : '未应用'}`);
   console.log(`重试表档数: ${s.tableExpanded ? '10 档' : '原始（未扩写）'}`);
 } else if (command === 'apply') {
   applyPatch(file);
