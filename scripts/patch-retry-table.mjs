@@ -13,6 +13,8 @@
  *
  * 补丁内容（全部幂等、按结构匹配、不依赖压缩后的变量名）：
  *   1. 重试延迟：每次重试随机 3–13 秒（3e3+1e4*Math.random()），替代固定退避表；
+ *      并以 streamRecoveryRetryCount<10 显式保留 10 次上限（官方靠查表越界
+ *      返回 undefined 停止，换随机表达式后会退化为无限重试，须显式判定）；
  *   2. 错误码白名单 {3008,3009,3010} → 追加 {1302,1303,1305} 并发限流码；
  *   3. v8e() 增加消息兜底：错误链上任何一层 message 命中
  *      /concurrency|busy|overload|繁忙/i 即视为可重试（覆盖无码场景）；
@@ -72,14 +74,17 @@ function locate() {
 const PATCHES = [
   {
     id: 'random-delay',
-    describe: '重试延迟改为每次随机 3–13 秒',
-    // …&&v8e(e.error))return D3o[e.state.streamRecoveryRetryCount]  →  return 3e3+1e4*Math.random()
-    detect: (text) => text.includes(`)return ${RANDOM_DELAY}`),
-    regex: /has\(e\.providerId\)&&([\w$]+)\(e\.error\)\)return [\w$]+\[e\.state\.streamRecoveryRetryCount\]/,
+    describe: '重试延迟改为每次随机 3–13 秒，并保留 10 次上限（替代查表越界停止机制）',
+    // 官方：…&&v8e(e.error))return D3o[e.state.streamRecoveryRetryCount]  ← 查表越界(≥length)返回 undefined 即停止
+    // 旧补丁退化：)return 3e3+1e4*Math.random()  ← 恒有值 = 无限重试（回归，需迁移）
+    // 目标：)return e.state.streamRecoveryRetryCount<10?3e3+1e4*Math.random():void 0
+    detect: (text) => text.includes(`)return e.state.streamRecoveryRetryCount<10?(${RANDOM_DELAY}):void 0`),
+    regex:
+      /has\(e\.providerId\)&&([\w$]+)\(e\.error\)\)return (?:[\w$]+\[e\.state\.streamRecoveryRetryCount\]|3e3\+1e4\*Math\.random\(\))/,
     replace: (text) =>
       text.replace(
-        /has\(e\.providerId\)&&([\w$]+)\(e\.error\)\)return [\w$]+\[e\.state\.streamRecoveryRetryCount\]/,
-        (_m, fn) => `has(e.providerId)&&${fn}(e.error))return ${RANDOM_DELAY}`,
+        /has\(e\.providerId\)&&([\w$]+)\(e\.error\)\)return (?:[\w$]+\[e\.state\.streamRecoveryRetryCount\]|3e3\+1e4\*Math\.random\(\))/,
+        (_m, fn) => `has(e.providerId)&&${fn}(e.error))return e.state.streamRecoveryRetryCount<10?(${RANDOM_DELAY}):void 0`,
       ),
   },
   {
