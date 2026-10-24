@@ -87,8 +87,9 @@ Intercepted directly by the UserPromptSubmit hook — **no model call, zero toke
 For the free Start Plan, the banner "当前系统繁忙…" kills the turn via `turn.failed`, which fires **no hooks at all** (an architectural blind spot of the hook system). Root cause confirmed in 0.2.1: the banner hides an SSE stream error `model concurrency limit exceeded` (GLM error code 1302 family), while the client's turn-level retry gate only accepts error codes {3008, 3009, 3010} — concurrency codes aren't whitelisted and the error often carries no parseable numeric code, so the turn fails with **zero retries**. [`scripts/patch-retry-table.mjs`](scripts/patch-retry-table.mjs) fixes all three angles:
 
 1. adds 1302 / 1303 / 1305 (concurrency limit codes) to the retry whitelist;
-2. adds a message-based fallback to the retry gate: any error in the cause chain whose message matches `concurrency / busy / overload / 繁忙` is retryable (covers the no-code case);
-3. retry delay becomes **random 3–13 seconds per retry** (up to 10 retries, replacing the fixed backoff table).
+2. adds a message-based fallback to the turn-level retry gate: any error in the cause chain whose message matches `concurrency / busy / overload / 繁忙` is retryable (covers the no-code case);
+3. retry delay becomes **random 3–13 seconds per retry** (up to 10 retries, replacing the fixed backoff table);
+4. the adapter-level error classifier gets the same message-based fallback marking `retryable=true` — background model requests that never go through the main turn loop (session hydration; the error dialog shows TraceID `hydrate-trace`) only pass through this classifier, and without the patch concurrency errors still fail with zero retries there.
 
 ```bash
 node scripts/patch-retry-table.mjs apply    # reversible, idempotent, backs up zcode.cjs

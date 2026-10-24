@@ -16,7 +16,10 @@
  *   2. 错误码白名单 {3008,3009,3010} → 追加 {1302,1303,1305} 并发限流码；
  *   3. v8e() 增加消息兜底：错误链上任何一层 message 命中
  *      /concurrency|busy|overload|繁忙/i 即视为可重试（覆盖无码场景）；
- *   4. （仅对官方原始文件）扩写重试表档数 2 → 10（P3o=10 次上限的配套长度）。
+ *   4. 适配器层错误分类（toAdapterError 的 fallback 分支）同样按消息兜底判
+ *      retryable=true——会话水合（hydrate-trace）等**不走主回合循环**的后台
+ *      模型请求只依赖这层分类，否则并发错误仍会一次不试直接失败；
+ *   5. （仅对官方原始文件）扩写重试表档数 2 → 10（P3o=10 次上限的配套长度）。
  *
  * 用法：
  *   node patch-retry-table.mjs apply    # 应用补丁（幂等）
@@ -106,6 +109,24 @@ const PATCHES = [
           'return!1}',
       ),
   },
+  {
+    id: 'adapter-fallback',
+    describe: '适配器层分类兜底：busy/concurrency 消息判为可重试（覆盖水合等非回合请求路径）',
+    // let _=Uro(n);return{code:as.ModelRequestFailed,…,retryable:_,…}
+    // → let _=/busy…/i.test(错误及其 cause 的消息)||Uro(n);return{…}
+    detect: (text) => /let [\w$]+=\/concurrency\|busy\|overload\|繁忙\/i\.test/.test(text),
+    regex: /let ([\w$]+)=([\w$]+)\(([\w$]+)\);return\{code:([\w$]+)\.ModelRequestFailed,message:\1\?"Provider marked the model request as retryable\./,
+    replace: (text) => {
+      const m = text.match(
+        /let ([\w$]+)=([\w$]+)\(([\w$]+)\);return\{code:([\w$]+)\.ModelRequestFailed,message:\1\?"Provider marked the model request as retryable\./,
+      );
+      const [, fb, fn, arg, enumName] = m;
+      return text.replace(m[0],
+        `let ${fb}=/${FALLBACK_SNIPPET}/i.test(String(${arg}&&${arg}.message||"")` +
+        `+String(${arg}&&${arg}.cause&&${arg}.cause.message||""))||${fn}(${arg});` +
+        `return{code:${enumName}.ModelRequestFailed,message:${fb}?"Provider marked the model request as retryable.`);
+    },
+  },
 ];
 
 // 旧补丁：扩写重试表档数（仅当文件仍是官方 2 档表时需要；已被 10 档则跳过）
@@ -128,6 +149,7 @@ function inspect(text) {
     randomDelay: applied.includes('random-delay'),
     retryCodes: applied.includes('retry-codes'),
     messageFallback: applied.includes('message-fallback'),
+    adapterFallback: applied.includes('adapter-fallback'),
     tableExpanded: text.includes(PATCHED_TABLE),
   };
 }
@@ -177,6 +199,7 @@ if (command === 'status') {
   console.log(`随机延迟 3-13s: ${s.randomDelay ? '已应用' : '未应用'}`);
   console.log(`并发错误码白名单: ${s.retryCodes ? '已应用' : '未应用'}`);
   console.log(`消息兜底匹配: ${s.messageFallback ? '已应用' : '未应用'}`);
+  console.log(`适配器层兜底: ${s.adapterFallback ? '已应用' : '未应用'}`);
   console.log(`重试表档数: ${s.tableExpanded ? '10 档' : '原始（未扩写）'}`);
 } else if (command === 'apply') {
   applyPatch(file);

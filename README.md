@@ -87,8 +87,9 @@
 ZCode 对免费 Start Plan 的「当前系统繁忙，请切换模型、升级账户，或稍后再试」走的是 `turn.failed` 路径，**不触发任何钩子**（钩子系统的架构盲区）。0.2.1 实测复盘定位到真正根因：横幅背后是服务端在 SSE 流里下发的 `model concurrency limit exceeded`（GLM 错误码 1302 系），而客户端回合级重试判定只认错误码 {3008, 3009, 3010}——并发限流码不在白名单、且该错误常不带可解析的数字码，于是**一次都不重试直接失败**。[`scripts/patch-retry-table.mjs`](scripts/patch-retry-table.mjs) 三管齐下：
 
 1. 错误码白名单追加 1302 / 1303 / 1305（并发限流系）；
-2. 判定函数增加消息兜底：错误链上任何一层 message 命中 `concurrency / busy / overload / 繁忙` 即视为可重试（覆盖无码场景）；
-3. 重试延迟改为**每次随机 3–13 秒**（最多 10 次，替换原固定退避表）。
+2. 回合级判定函数增加消息兜底：错误链上任何一层 message 命中 `concurrency / busy / overload / 繁忙` 即视为可重试（覆盖无码场景）；
+3. 重试延迟改为**每次随机 3–13 秒**（最多 10 次，替换原固定退避表）；
+4. 适配器层错误分类同样按消息兜底判 `retryable=true`——会话水合（错误详情里 TraceID 为 `hydrate-trace`）等**不走主回合循环**的后台模型请求只经过这一层分类，没有它的话并发错误在这些路径上仍会零重试直接失败。
 
 ```bash
 node scripts/patch-retry-table.mjs apply    # 可逆、幂等，自动备份 zcode.cjs
