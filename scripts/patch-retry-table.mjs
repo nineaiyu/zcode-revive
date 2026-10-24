@@ -21,7 +21,10 @@
  *   4. 适配器层错误分类（toAdapterError 的 fallback 分支）同样按消息兜底判
  *      retryable=true——会话水合（hydrate-trace）等**不走主回合循环**的后台
  *      模型请求只依赖这层分类，否则并发错误仍会一次不试直接失败；
- *   5. （仅对官方原始文件）扩写重试表档数 2 → 10（P3o=10 次上限的配套长度）。
+ *   5. 模型请求成功即清零重试计数——官方计数器只在回合创建时清零、成功不清零，
+ *      长回合中「3 次重试成功 → 稍后再失败」只剩 7 次额度；清零后 10 次上限
+ *      按「连续失败」计，与直觉一致；
+ *   6. （仅对官方原始文件）扩写重试表档数 2 → 10（P3o=10 次上限的配套长度）。
  *
  * 用法：
  *   node patch-retry-table.mjs apply    # 应用补丁（幂等）
@@ -132,6 +135,20 @@ const PATCHES = [
         `return{code:${enumName}.ModelRequestFailed,message:${fb}?"Provider marked the model request as retryable.`);
     },
   },
+  {
+    id: 'reset-on-success',
+    describe: '模型请求成功即清零失败连击（10 次上限按「连续失败」计，而非整回合累计）',
+    // try{ …await this.runModelTextRequest(…),kd(e.turnAbortSignal)}catch(je){
+    //                                              ↑ 成功路径最后一条语句
+    // → kd(e.turnAbortSignal),e.streamRecoveryRetryCount=0}catch(je){
+    detect: (text) => /\.streamRecoveryRetryCount=0\}catch\(/.test(text),
+    regex: /([\w$]+)\(([\w$]+)\.turnAbortSignal\)\}catch\(/,
+    replace: (text) =>
+      text.replace(
+        /([\w$]+)\(([\w$]+)\.turnAbortSignal\)\}catch\(/,
+        (_m, fn, st) => `${fn}(${st}.turnAbortSignal),${st}.streamRecoveryRetryCount=0}catch(`,
+      ),
+  },
 ];
 
 // 旧补丁：扩写重试表档数（仅当文件仍是官方 2 档表时需要；已被 10 档则跳过）
@@ -155,6 +172,7 @@ function inspect(text) {
     retryCodes: applied.includes('retry-codes'),
     messageFallback: applied.includes('message-fallback'),
     adapterFallback: applied.includes('adapter-fallback'),
+    resetOnSuccess: applied.includes('reset-on-success'),
     tableExpanded: text.includes(PATCHED_TABLE),
   };
 }
@@ -205,6 +223,7 @@ if (command === 'status') {
   console.log(`并发错误码白名单: ${s.retryCodes ? '已应用' : '未应用'}`);
   console.log(`消息兜底匹配: ${s.messageFallback ? '已应用' : '未应用'}`);
   console.log(`适配器层兜底: ${s.adapterFallback ? '已应用' : '未应用'}`);
+  console.log(`成功清零连击: ${s.resetOnSuccess ? '已应用' : '未应用'}`);
   console.log(`重试表档数: ${s.tableExpanded ? '10 档' : '原始（未扩写）'}`);
 } else if (command === 'apply') {
   applyPatch(file);

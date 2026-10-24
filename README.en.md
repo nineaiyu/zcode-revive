@@ -88,8 +88,9 @@ For the free Start Plan, the banner "当前系统繁忙…" kills the turn via `
 
 1. adds 1302 / 1303 / 1305 (concurrency limit codes) to the retry whitelist;
 2. adds a message-based fallback to the turn-level retry gate: any error in the cause chain whose message matches `concurrency / busy / overload / 繁忙` is retryable (covers the no-code case);
-3. retry delay becomes **random 3–13 seconds per retry** (up to 10 retries, replacing the fixed backoff table);
-4. the adapter-level error classifier gets the same message-based fallback marking `retryable=true` — background model requests that never go through the main turn loop (session hydration; the error dialog shows TraceID `hydrate-trace`) only pass through this classifier, and without the patch concurrency errors still fail with zero retries there.
+3. retry delay becomes **random 3–13 seconds per retry** (cap: 10 *consecutive* failures, replacing the fixed backoff table);
+4. the adapter-level error classifier gets the same message-based fallback marking `retryable=true` — background model requests that never go through the main turn loop (session hydration; the error dialog shows TraceID `hydrate-trace`) only pass through this classifier, and without the patch concurrency errors still fail with zero retries there;
+5. **the retry counter resets on any successful model request** — officially it accumulates for the whole turn (retry 3×, succeed, then fail again later and only 7 retries remain); with the reset the cap truly counts 10 consecutive failures.
 
 ```bash
 node scripts/patch-retry-table.mjs apply    # reversible, idempotent, backs up zcode.cjs
@@ -116,7 +117,7 @@ ZCode ships a built-in goal loop: `/goal <objective>` verifies progress after ev
 ## Configuration & troubleshooting
 
 > [!IMPORTANT]
-> **A red "Model request failed." banner ≠ broken plugin.** That banner means the turn *failed* (`turn.failed`) — ZCode fires **no hooks** on this path, so the plugin cannot act (architectural blind spot, see above). It's usually local network / proxy flakiness or server-side congestion: the retry patch already auto-retries inside the client (random 3–13 s per retry, up to 10 times); if it still fails, just send "continue" manually to pick up.
+> **A red "Model request failed." banner ≠ broken plugin.** That banner means the turn *failed* (`turn.failed`) — ZCode fires **no hooks** on this path, so the plugin cannot act (architectural blind spot, see above). It's usually local network / proxy flakiness or server-side congestion: the retry patch already auto-retries inside the client (random 3–13 s per retry; gives up only after 10 consecutive failures, and any successful request resets the streak); if it still fails, just send "continue" manually to pick up.
 >
 > **How to verify the plugin is fine**: click the anchor icon next to the input box to inspect hook timings (green = healthy), or run `/revive status` and look for "running".
 
