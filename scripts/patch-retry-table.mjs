@@ -1,20 +1,30 @@
 #!/usr/bin/env node
 /**
- * patch-retry-table.mjs — 给 ZCode 客户端的「Start Plan 繁忙」重试表打补丁
+ * patch-retry-table.mjs — 给 ZCode 客户端的「Start Plan 繁忙 / 并发超限」重试机制打补丁
  *
- * 背景：Zcode 对免费 Start Plan（builtin:zai-start-plan / bigmodel-start-plan）
- * 的接入队列繁忙（admission busy）只重试 2 次（1s、2s）就判
- * 「当前自动重试已达到最大次数」并使回合失败（turn.failed）。
- * 该路径不触发任何钩子，revive 插件无法介入，因此直接扩写
- * 客户端内置的重试延迟表：最多 9 次重试，总等待约 4 分钟。
+ * 背景（v0.2.1 实测复盘）：
+ * 「当前系统繁忙，请切换模型、升级账户，或稍后再试」横幅背后是服务端在 SSE 流里
+ * 下发的错误（典型消息 "model concurrency limit exceeded"，GLM 错误码 1302 系）。
+ * 客户端回合级重试的判定 v8e() 只认错误码 {3008, 3009, 3010}：
+ *   - 1302/1303/1305 等并发限流码不在白名单；
+ *   - SSE 错误事件若未被解析出数字码，链路上根本没有码可查。
+ * 两种情况 v8e() 都返回 false → L3o() 返回 undefined → 不重试 → turn 直接失败。
+ * 该失败路径不触发任何钩子，revive 插件无法介入，只能补客户端。
+ *
+ * 补丁内容（全部幂等、按结构匹配、不依赖压缩后的变量名）：
+ *   1. 重试延迟：每次重试随机 3–13 秒（3e3+1e4*Math.random()），替代固定退避表；
+ *   2. 错误码白名单 {3008,3009,3010} → 追加 {1302,1303,1305} 并发限流码；
+ *   3. v8e() 增加消息兜底：错误链上任何一层 message 命中
+ *      /concurrency|busy|overload|繁忙/i 即视为可重试（覆盖无码场景）；
+ *   4. （仅对官方原始文件）扩写重试表档数 2 → 10（P3o=10 次上限的配套长度）。
  *
  * 用法：
  *   node patch-retry-table.mjs apply    # 应用补丁（幂等）
- *   node patch-retry-table.mjs revert   # 还原为官方原始表
+ *   node patch-retry-table.mjs revert   # 还原为官方原始文件
  *   node patch-retry-table.mjs status   # 查看当前状态
  *
  * 注意：ZCode 升级会覆盖 zcode.cjs，升级后需重新执行 apply。
- * 原始文件备份为 zcode.cjs.bak（首次 apply 时自动创建）。
+ * 原始文件备份为 zcode.cjs.bak（首次 apply 时自动创建），改完需重启 ZCode 生效。
  */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -37,11 +47,13 @@ const CANDIDATES = [
   '/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs',
 ].filter(Boolean);
 
-// 版本自适应：定位「Start Plan 繁忙」重试表（特征：紧邻 start-plan provider 集合定义的 [1e3,2e3] 数组）
-// 0.16.x: M9r=[1e3,2e3]（1 处）；0.17.x: D3o/U3o=[1e3,2e3]（2 处）。不依赖变量名。
-// 10 档延迟：9 次重试，总等待约 228s
+// 10 档延迟表（旧补丁遗留：档数配套 P3o=10 的重试上限；取值已被随机延迟取代，
+// 仅 U3o「目标验证」重试循环仍在用这张表的数值）
 const PATCHED_TABLE = '[1e3,2e3,5e3,1e4,15e3,3e4,45e3,6e4,6e4,6e4]';
 
+const RANDOM_DELAY = '3e3+1e4*Math.random()';
+const FALLBACK_SNIPPET = 'concurrency|busy|overload|繁忙';
+const EXTRA_CODES = '"1302","1303","1305"';
 
 function locate() {
   for (const file of CANDIDATES) {
@@ -50,47 +62,109 @@ function locate() {
   throw new Error('未找到 zcode.cjs，可用 ZCODE_CJS_PATH 环境变量或 scripts/.local-paths.json 指定路径');
 }
 
-function findTables(text) {
-  // 匹配 <var>=[1e3,2e3]，且其前 200 字符内出现 start-plan 集合定义，避免误伤无关代码
-  const out = [];
-  const re = /([\w$]+)=\[1e3,2e3(,5e3,1e4,15e3,3e4,45e3,6e4,6e4,6e4)?\]/g;
-  let m;
-  while ((m = re.exec(text)) !== null) {
-    const ctx = text.slice(Math.max(0, m.index - 400), m.index + 400);
-    if (ctx.includes('start-plan')) out.push({ start: m.index, end: m.index + m[0].length, full: m[0] });
-  }
-  return out;
+// ---------------------------------------------------------------------------
+// 结构化补丁：每个补丁用正则定位（跨版本稳定），带已应用检测与幂等替换
+// ---------------------------------------------------------------------------
+
+const PATCHES = [
+  {
+    id: 'random-delay',
+    describe: '重试延迟改为每次随机 3–13 秒',
+    // …&&v8e(e.error))return D3o[e.state.streamRecoveryRetryCount]  →  return 3e3+1e4*Math.random()
+    detect: (text) => text.includes(`)return ${RANDOM_DELAY}`),
+    regex: /has\(e\.providerId\)&&([\w$]+)\(e\.error\)\)return [\w$]+\[e\.state\.streamRecoveryRetryCount\]/,
+    replace: (text) =>
+      text.replace(
+        /has\(e\.providerId\)&&([\w$]+)\(e\.error\)\)return [\w$]+\[e\.state\.streamRecoveryRetryCount\]/,
+        (_m, fn) => `has(e.providerId)&&${fn}(e.error))return ${RANDOM_DELAY}`,
+      ),
+  },
+  {
+    id: 'retry-codes',
+    describe: '错误码白名单追加 1302/1303/1305（并发限流）',
+    // R3o=new Set(["3008","3009","3010"])  →  追加 1302/1303/1305
+    detect: (text) => new RegExp(`[\\w$]+=new Set\\(\\["3008","3009","3010","1302"`).test(text),
+    regex: /[\w$]+=new Set\(\["3008","3009","3010"\]\)/,
+    replace: (text) =>
+      text.replace(
+        /([\w$]+)=new Set\(\["3008","3009","3010"\]\)/,
+        (_m, name) => `${name}=new Set(["3008","3009","3010",${EXTRA_CODES}])`,
+      ),
+  },
+  {
+    id: 'message-fallback',
+    describe: 'v8e 增加消息兜底匹配（concurrency/busy/overload/繁忙）',
+    // if(o&&R3o.has(o))return!0}return!1}  →  …return!0;if(/…/i.test(…))return!0}return!1}
+    detect: (text) => text.includes(FALLBACK_SNIPPET),
+    regex: /if\(o&&[\w$]+\.has\(o\)\)return!0\}return!1\}/,
+    replace: (text) =>
+      text.replace(
+        /if\(o&&([\w$]+)\.has\(o\)\)return!0\}return!1\}/,
+        (_m, set) =>
+          `if(o&&${set}.has(o))return!0;` +
+          `if(/${FALLBACK_SNIPPET}/i.test(String(t&&t.message||"")))return!0}` +
+          'return!1}',
+      ),
+  },
+];
+
+// 旧补丁：扩写重试表档数（仅当文件仍是官方 2 档表时需要；已被 10 档则跳过）
+function patchTable(text) {
+  if (!/\[1e3,2e3\]/.test(text)) return { text, count: 0 };
+  let count = 0;
+  // 只动紧邻 start-plan 上下文的表，避免误伤无关代码
+  text = text.replace(/([\w$]+)=\[1e3,2e3\]/g, (full, name, offset) => {
+    const ctx = text.slice(Math.max(0, offset - 400), offset + 400);
+    if (!ctx.includes('start-plan')) return full;
+    count += 1;
+    return `${name}=${PATCHED_TABLE}`;
+  });
+  return { text, count };
 }
 
-function status(file) {
-  const text = fs.readFileSync(file, 'utf8');
-  const tables = findTables(text);
-  if (tables.length === 0) return { state: 'not-found', tables };
-  const patched = tables.filter((x) => x.full.includes('5e3'));
-  return { state: patched.length === tables.length ? 'patched' : 'original', tables };
+function inspect(text) {
+  const applied = PATCHES.filter((p) => p.detect(text)).map((p) => p.id);
+  return {
+    randomDelay: applied.includes('random-delay'),
+    retryCodes: applied.includes('retry-codes'),
+    messageFallback: applied.includes('message-fallback'),
+    tableExpanded: text.includes(PATCHED_TABLE),
+  };
 }
 
 function applyPatch(file) {
   const backup = file + '.bak';
   let text = fs.readFileSync(file, 'utf8');
-  const tables = findTables(text);
-  if (tables.length === 0) {
-    console.error('未在 zcode.cjs 中找到 Start Plan 重试表（可能版本更新再次改变了代码），未做修改');
-    process.exit(1);
+  const before = inspect(text);
+  const changes = [];
+
+  if (!before.tableExpanded) {
+    const { text: next, count } = patchTable(text);
+    if (count > 0) {
+      text = next;
+      changes.push(`重试表扩写 ${count} 处（2 档 → 10 档）`);
+    }
+  }
+  for (const p of PATCHES) {
+    if (p.detect(text)) continue; // 已应用
+    if (!p.regex.test(text)) {
+      console.error(`× 补丁「${p.id}」定位失败（客户端结构可能已变化），跳过该项`);
+      continue;
+    }
+    text = p.replace(text);
+    changes.push(p.describe);
+  }
+
+  if (changes.length === 0) {
+    console.log('所有补丁均已应用，无需修改');
+    return;
   }
   if (!fs.existsSync(backup)) {
     fs.copyFileSync(file, backup);
     console.log('已备份原文件 ->', backup);
   }
-  // 从后往前替换，避免偏移失效
-  let count = 0;
-  for (let i = tables.length - 1; i >= 0; i -= 1) {
-    const x = tables[i];
-    text = text.slice(0, x.start) + x.full.replace('[1e3,2e3]', PATCHED_TABLE) + text.slice(x.end);
-    count += 1;
-  }
   fs.writeFileSync(file, text);
-  console.log(`已扩写 ${count} 处重试表：2 次(1s,2s) -> 9 次(1s~60s，约 4 分钟)`);
+  for (const c of changes) console.log('✓', c);
   console.log('重启 ZCode 后生效');
 }
 
@@ -99,12 +173,13 @@ const file = locate();
 
 if (command === 'status') {
   console.log(`zcode.cjs: ${file}`);
-  const s = status(file);
-  console.log(`重试表: ${s.state}（找到 ${s.tables.length} 处）`);
+  const s = inspect(fs.readFileSync(file, 'utf8'));
+  console.log(`随机延迟 3-13s: ${s.randomDelay ? '已应用' : '未应用'}`);
+  console.log(`并发错误码白名单: ${s.retryCodes ? '已应用' : '未应用'}`);
+  console.log(`消息兜底匹配: ${s.messageFallback ? '已应用' : '未应用'}`);
+  console.log(`重试表档数: ${s.tableExpanded ? '10 档' : '原始（未扩写）'}`);
 } else if (command === 'apply') {
-  const s = status(file);
-  if (s.state === 'patched') console.log('已是补丁状态，无需重复应用');
-  else if (s.state === 'original' || s.state === 'not-found') applyPatch(file);
+  applyPatch(file);
 } else if (command === 'revert') {
   const backup = file + '.bak';
   if (!fs.existsSync(backup)) {

@@ -15,7 +15,7 @@
       "description_i18n": {
         "zh-CN": "当回合因「系统繁忙」等临时错误、输出截断或空响应中断时，自动注入继续指令恢复任务。"
       },
-      "version": "0.2.0",
+      "version": "0.2.1",
       "author": {
         "name": "zcode-revive contributors"
       },
